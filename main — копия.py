@@ -1,0 +1,158 @@
+import asyncio
+import sqlite3
+import logging
+import random
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.filters import Command
+from aiogram.fsm.state import StatesGroup, State
+from aiogram.fsm.context import FSMContext
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+
+# --- НАСТРОЙКИ ---
+API_TOKEN = 'XXXXXXXXXXXXXXXXXX'
+ADMIN_ID = XXXXXXXXXXXXXX
+
+logging.basicConfig(level=logging.INFO) #Настраивает логирование. Уровень INFO означает, что в консоли вы будете видеть не только ошибки, но и важную служебную информацию: например, отчеты о запуске бота или уведомления о входящих сообщениях. Это помогает понимать, что происходит «под капотом» в реальном времени.
+bot = Bot(token=API_TOKEN) #Создает экземпляр бота с нашим токеном
+dp = Dispatcher() #создает диспетчера
+
+# --- БАЗА ДАННЫХ --- 
+def init_db():
+    with sqlite3.connect('dating_bot.db') as conn:
+        cur = conn.cursor()
+        cur.execute('''CREATE TABLE IF NOT EXISTS users 
+                       (id INTEGER PRIMARY KEY, name TEXT, age INTEGER, photo_id TEXT, status TEXT)''')
+        conn.commit()
+
+class Reg(StatesGroup):
+    name = State()
+    age = State()
+    photo = State()
+
+# --- ЛОГИКА РЕГИСТРАЦИИ ---
+@dp.message(Command("start"))
+async def start(message: types.Message, state: FSMContext):
+    uid = message.from_user.id
+    with sqlite3.connect('dating_bot.db') as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT status FROM users WHERE id = ?", (uid,))
+        user = cur.fetchone()
+    
+    if user:
+        if user[0] == 'active':
+            return await message.answer("Твоя анкета активна! Жми /search чтобы смотреть других.")
+        if user[0] == 'moderate':
+            return await message.answer("Твоя анкета еще на проверке.")
+            
+    await message.answer("Привет! Давай создадим анкету. Как тебя зовут?")
+    await state.set_state(Reg.name)
+
+@dp.message(Reg.name)
+async def get_name(message: types.Message, state: FSMContext):
+    await state.update_data(name=message.text)
+    await message.answer("Сколько тебе лет?")
+    await state.set_state(Reg.age)
+
+@dp.message(Reg.age)
+async def get_age(message: types.Message, state: FSMContext):
+    if not message.text.isdigit():
+        return await message.answer("Введи возраст числом!")
+    await state.update_data(age=int(message.text))
+    await message.answer("Пришли свое фото")
+    await state.set_state(Reg.photo)
+
+@dp.message(Reg.photo, F.photo)
+async def get_photo(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    photo_id = message.photo[-1].file_id
+    uid = message.from_user.id
+    
+    with sqlite3.connect('dating_bot.db') as conn:
+        cur = conn.cursor()
+        cur.execute("INSERT OR REPLACE INTO users VALUES (?, ?, ?, ?, ?)", 
+                    (uid, data['name'], data['age'], photo_id, 'moderate'))
+        conn.commit()
+    
+    await message.answer("Готово! Анкета отправлена админу.")
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Одобрить", callback_data=f"app_{uid}"),
+        InlineKeyboardButton(text="❌ Бан", callback_data=f"ban_{uid}")
+    ]])
+    await bot.send_photo(ADMIN_ID, photo_id, 
+                         caption=f"Новая анкета:\n{data['name']}, {data['age']}\nID: {uid}", 
+                         reply_markup=kb)
+    await state.clear()
+
+# --- ЛОГИКА ПОИСКА ---
+@dp.message(Command("search"))
+async def search(message: types.Message):
+    uid = message.from_user.id
+    with sqlite3.connect('dating_bot.db') as conn:
+        cur = conn.cursor()
+        # Ищем случайную активную анкету, кроме своей
+        cur.execute("SELECT id, name, age, photo_id FROM users WHERE status = 'active' AND id != ? ORDER BY RANDOM() LIMIT 1", (uid,))
+        target = cur.fetchone()
+
+    if not target:
+        return await message.answer("Пока никого нет... Попробуй позже!")
+
+    target_id, name, age, photo_id = target
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="❤️ Лайк", callback_data=f"like_{target_id}"),
+        InlineKeyboardButton(text="👎 Дальше", callback_data="search")
+    ]])
+    
+    await bot.send_photo(uid, photo_id, caption=f"{name}, {age}", reply_markup=kb)
+
+# --- ОБРАБОТКА КНОПОК ---
+@dp.callback_query(F.data == "search")
+async def next_user(call: types.CallbackQuery):
+    await call.message.delete()
+    await search(call.message)
+
+@dp.callback_query(F.data.startswith("like_"))
+async def like(call: types.CallbackQuery):
+    target_id = int(call.data.split("_")[1])
+    # Уведомляем того, кого лайкнули
+    try:
+        await bot.send_message(target_id, f"Ты кому-то понравился! Введи /search, чтобы найти свою половинку.")
+    except:
+        pass
+    await call.answer("Лайк отправлен!", show_alert=False)
+    await search(call.message)
+
+@dp.callback_query(F.data.startswith("app_"))
+async def approve(call: types.CallbackQuery):
+    user_id = int(call.data.split("_")[1])
+    with sqlite3.connect('dating_bot.db') as conn:
+        cur = conn.cursor()
+        cur.execute("UPDATE users SET status = 'active' WHERE id = ?", (user_id,))
+        conn.commit()
+    await bot.send_message(user_id, "Твоя анкета одобрена! Теперь ты можешь искать людей с помощью /search")
+    await call.message.edit_caption(caption="✅ Анкету одобрил")
+
+@dp.callback_query(F.data.startswith("ban_"))
+async def ban(call: types.CallbackQuery):
+    user_id = int(call.data.split("_")[1])
+    with sqlite3.connect('dating_bot.db') as conn:
+        cur = conn.cursor()
+        cur.execute("UPDATE users SET status = 'banned' WHERE id = ?", (user_id,))
+        conn.commit()
+    await call.message.edit_caption(caption="❌ Забанен")
+
+async def main():
+    init_db()
+    await dp.start_polling(bot)
+
+if __name__ == '__main__': #проверяет, запущен ли файл напрямую. (Если вы 
+                            #просто импортируете этот файл в другой проект, 
+                            #код внутри этого условия не выполнится.) 
+                            #Это защищает от случайного запуска логики
+    try:
+        asyncio.run(main()) ###пытается запустить главную асинхронную функцию main(). 
+                                 #Метод asyncio.run создает цикл событий (event loop), 
+                                    #выполняет программу и закрывает его по завершении##
+
+    except KeyboardInterrupt:   #перехватывает нажатие клавиш Ctrl+C. Без этого блока при попытке остановить бота вручную консоль выдала бы длинную «простыню» с ошибкой (Traceback) 
+        print("Бот выключен")
